@@ -25948,6 +25948,44 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_selected);
+
+/* Mirror of the routed_moe_launch() streaming match: the compact selected
+ * slab is only usable when it was loaded for this exact layer/tensor layout
+ * and covers every token/expert slot of this call. */
+static int cuda_glm_stream_selected_cache_matches(
+        const void *model_map,
+        uint32_t layer_index,
+        uint32_t n_total_expert,
+        uint64_t required_slot_count,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        int logical_tier) {
+    return g_stream_selected_cache.valid &&
+           g_stream_selected_cache.logical_tier == logical_tier &&
+           g_stream_selected_cache.model_map == model_map &&
+           g_stream_selected_cache.layer == layer_index &&
+           g_stream_selected_cache.n_total_expert == n_total_expert &&
+           g_stream_selected_cache.slot_count >= required_slot_count &&
+           g_stream_selected_cache.gate_offset == gate_offset &&
+           g_stream_selected_cache.up_offset == up_offset &&
+           g_stream_selected_cache.down_offset == down_offset &&
+           g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
+           g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
+           g_stream_selected_cache.gate_ptr &&
+           g_stream_selected_cache.up_ptr &&
+           g_stream_selected_cache.down_ptr &&
+           g_stream_selected_cache.slot_selected_tensor.ptr &&
+           g_stream_selected_cache.slot_selected_tensor.bytes >=
+               required_slot_count * sizeof(int32_t);
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -25975,16 +26013,20 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
-        uint32_t                mid_token_stride) {
-    (void)layer_index; (void)n_total_expert;
+        uint32_t                mid_token_stride,
+        bool                    force_resident) {
+    (void)force_resident;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
     if (gate_type != 10u || up_type != 10u || down_type != 10u) {
-        fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",
-                gate_type, up_type, down_type);
+        fprintf(stderr,
+                "ds4: glm routed moe: unsupported expert types "
+                "gate=%u up=%u down=%u at layer %u "
+                "(CUDA supports all-Q2_K(10) routed experts)\n",
+                gate_type, up_type, down_type, layer_index);
         return 0;
     }
     if (mid_token_stride != n_expert * expert_mid_dim) {
@@ -25994,15 +26036,70 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         return 0;
     }
     const int logical_tier = cuda_current_tier();
-    const char *gw = (const char *)cuda_resolve_weight_ptr(model_map,
-            gate_offset, (uint64_t)256 * gate_expert_bytes, logical_tier,
-            "glm_gate_exps");
-    const char *uw = (const char *)cuda_resolve_weight_ptr(model_map,
-            up_offset, (uint64_t)256 * up_expert_bytes, logical_tier,
-            "glm_up_exps");
-    const char *dw = (const char *)cuda_resolve_weight_ptr(model_map,
-            down_offset, (uint64_t)256 * down_expert_bytes, logical_tier,
-            "glm_down_exps");
+    const char *gw = NULL;
+    const char *uw = NULL;
+    const char *dw = NULL;
+    if (g_ssd_streaming_mode) {
+        /* Streaming mode: consume the compact selected-expert slab instead
+         * of resolving the full expert tensors (which would device-cache
+         * the whole routed model). The slab up stride is gate_expert_bytes
+         * (the stream table carries no separate up size). */
+        if (up_expert_bytes != gate_expert_bytes) {
+            fprintf(stderr,
+                    "ds4: glm routed moe: streaming requires gate/up experts "
+                    "of identical size, got %llu vs %llu at layer %u\n",
+                    (unsigned long long)gate_expert_bytes,
+                    (unsigned long long)up_expert_bytes, layer_index);
+            return 0;
+        }
+        const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
+        if (required_slot_count > UINT32_MAX) return 0;
+        int cache_ok = cuda_glm_stream_selected_cache_matches(
+                model_map, layer_index, n_total_expert, required_slot_count,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes, logical_tier);
+        if (!cache_ok) {
+            /* Prefill (and any other caller without a host-side selected
+             * load) fills the slab here with the batch's expert union. */
+            ds4_gpu_stream_expert_table table;
+            table.model_map = model_map;
+            table.model_size = model_size;
+            table.layer = layer_index;
+            table.n_total_expert = n_total_expert;
+            table.gate_offset = gate_offset;
+            table.up_offset = up_offset;
+            table.down_offset = down_offset;
+            table.gate_expert_bytes = gate_expert_bytes;
+            table.down_expert_bytes = down_expert_bytes;
+            (void)ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                    &table, selected, (uint32_t)required_slot_count);
+            cache_ok = cuda_glm_stream_selected_cache_matches(
+                    model_map, layer_index, n_total_expert,
+                    required_slot_count, gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes, logical_tier);
+        }
+        if (!cache_ok) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected experts are unavailable "
+                    "for GLM layer %u (n_tokens=%u)\n",
+                    layer_index, n_tokens);
+            return 0;
+        }
+        selected = &g_stream_selected_cache.slot_selected_tensor;
+        gw = g_stream_selected_cache.gate_ptr;
+        uw = g_stream_selected_cache.up_ptr;
+        dw = g_stream_selected_cache.down_ptr;
+    } else {
+        gw = (const char *)cuda_resolve_weight_ptr(model_map,
+                gate_offset, (uint64_t)256 * gate_expert_bytes, logical_tier,
+                "glm_gate_exps");
+        uw = (const char *)cuda_resolve_weight_ptr(model_map,
+                up_offset, (uint64_t)256 * up_expert_bytes, logical_tier,
+                "glm_up_exps");
+        dw = (const char *)cuda_resolve_weight_ptr(model_map,
+                down_offset, (uint64_t)256 * down_expert_bytes, logical_tier,
+                "glm_down_exps");
+    }
     if (!gw || !uw || !dw) return 0;
 
     /* Stage 1: quantize x rows to q8_K (existing kernel). */
@@ -26328,7 +26425,6 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident) {
-    (void)force_resident;
     return ds4_gpu_glm_routed_moe_batch_tensor(out, mid,
             model_map, model_size,
             gate_offset, up_offset, down_offset,
@@ -26338,7 +26434,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, layer_index,
-            x, 1, n_expert * expert_mid_dim);
+            x, 1, n_expert * expert_mid_dim, force_resident);
 }
 
 /* Parallel router select: 256 threads compute sigmoid probs, then top-k
