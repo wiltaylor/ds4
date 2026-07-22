@@ -538,6 +538,8 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+static uint64_t cuda_model_cache_limit_bytes(void);
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
@@ -608,6 +610,18 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
+        fprintf(stderr,
+                "ds4: CUDA model weight cache budget exhausted caching %s "
+                "(%.2f MiB, cached %.2f GiB, limit %.2f GiB); "
+                "set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB to raise the budget\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0,
+                (double)limit / 1073741824.0);
+        return NULL;
+    }
     void *dev = NULL;
     err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
@@ -1752,7 +1766,26 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
+    if (gb == 0) {
+        /* SSD streaming budgets routed experts separately (the selected
+         * slab), so an unbounded dense-weight cache would defeat the whole
+         * streaming memory envelope: default to half of the free device
+         * memory seen at first use. Without streaming keep the historical
+         * unbounded behavior. */
+        if (!g_ssd_streaming_mode) return UINT64_MAX;
+        static uint64_t stream_default;
+        if (stream_default == 0) {
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                (void)cudaGetLastError();
+                free_bytes = 0;
+            }
+            stream_default = (uint64_t)free_bytes / 2u;
+            const uint64_t floor_bytes = 8ull * 1073741824ull;
+            if (stream_default < floor_bytes) stream_default = floor_bytes;
+        }
+        return stream_default;
+    }
     return gb * 1073741824ull;
 }
 
