@@ -20867,7 +20867,20 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: CUDA routed MoE: unsupported expert quant layout "
+                    "gate=%u down=%u at layer %u (supported: "
+                    "gate=IQ2_XXS(16)/down=Q2_K(10) or gate=down=Q4_K(12); "
+                    "GLM all-IQ2_XXS routed GGUFs are not supported on CUDA, "
+                    "use the all-Q2_K routed GGUF)\n",
+                    gate_type, down_type, layer_index);
+        }
+        return 0;
+    }
     /* Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
@@ -22022,7 +22035,18 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     }
     if (pack_fixed3 && resident_expert_base == 0u) return 0;
     const bool q4k_path = gate_type == 12u && down_type == 12u;
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: CUDA owned routed MoE: unsupported expert quant "
+                    "layout gate=%u down=%u (supported: "
+                    "gate=IQ2_XXS(16)/down=Q2_K(10) or gate=down=Q4_K(12))\n",
+                    gate_type, down_type);
+        }
+        return 0;
+    }
     if (q4k_path && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL) {
         fprintf(stderr, "ds4: CUDA owned Q4 decode does not support gate/up auxiliary output\n");
         return 0;
