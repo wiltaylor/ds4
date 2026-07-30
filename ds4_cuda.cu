@@ -5932,11 +5932,131 @@ static int cuda_q8_mma_try_launch(
         uint64_t blocks,
         uint64_t a_stride_blocks,
         uint64_t out_stride,
+        uint32_t T);
+
+/*
+ * One-time numerical validation of the Q8 WMMA kernel against the exact
+ * per-row kernel on a tiny synthetic problem.
+ *
+ * On GB10 (sm_121) the WMMA kernel launches without error and writes
+ * nothing, which turned every batched Q8 projection in the GLM indexed
+ * prefill into silent zeros -- attention effectively disabled, decode
+ * degenerate.  An arch blacklist would rot; comparing against the reference
+ * once per process catches any arch where the tensor-core path is wrong and
+ * simply falls back to the exact kernels.
+ */
+static int cuda_q8_mma_self_check_run(void) {
+    enum { SC_IN = 64u, SC_OUT = 64u, SC_TOK = 16u };
+    const uint64_t sc_blocks = SC_IN / 32u;      /* 2 */
+    const uint64_t w_bytes = (uint64_t)SC_OUT * sc_blocks * 34u;
+    const uint64_t xq_bytes = (uint64_t)SC_TOK * sc_blocks * 32u;
+    const uint64_t xs_count = (uint64_t)SC_TOK * sc_blocks;
+    const uint64_t out_count = (uint64_t)SC_TOK * SC_OUT;
+
+    unsigned char host_w[SC_OUT * 2u * 34u];
+    signed char host_xq[SC_TOK * 2u * 32u];
+    float host_xs[SC_TOK * 2u];
+    /* Deterministic bytes; every byte <= 0x3B keeps the embedded f16 block
+     * scales finite and small, so any layout reads sane values. */
+    for (uint64_t i = 0; i < w_bytes; i++) host_w[i] = (unsigned char)((i * 37u + 11u) % 0x3Cu);
+    for (uint64_t i = 0; i < xq_bytes; i++) host_xq[i] = (signed char)(((int)(i * 53u + 7u) % 51) - 25);
+    for (uint64_t i = 0; i < xs_count; i++) host_xs[i] = 0.5f + 0.03125f * (float)(i % 8u);
+
+    unsigned char *d_w = NULL;
+    int8_t *d_xq = NULL;
+    float *d_xs = NULL;
+    float *d_ref = NULL;
+    float *d_mma = NULL;
+    int ok = -1;   /* -1 = infrastructure failure: treat as "cannot verify" */
+    if (cudaMalloc((void **)&d_w, w_bytes) == cudaSuccess &&
+        cudaMalloc((void **)&d_xq, xq_bytes) == cudaSuccess &&
+        cudaMalloc((void **)&d_xs, xs_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc((void **)&d_ref, out_count * sizeof(float)) == cudaSuccess &&
+        cudaMalloc((void **)&d_mma, out_count * sizeof(float)) == cudaSuccess &&
+        cudaMemcpy(d_w, host_w, w_bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(d_xq, host_xq, xq_bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(d_xs, host_xs, xs_count * sizeof(float),
+                   cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemset(d_ref, 0xEE, out_count * sizeof(float)) == cudaSuccess &&
+        cudaMemset(d_mma, 0xEE, out_count * sizeof(float)) == cudaSuccess) {
+        dim3 rgrid(SC_OUT, SC_TOK, 1);
+        matmul_q8_0_preq_kernel<<<rgrid, 32>>>(d_ref, d_w, d_xq, d_xs,
+                                               SC_IN, SC_OUT, SC_TOK,
+                                               sc_blocks, cuda_q8_use_dp4a());
+        const int mma_rc = cuda_q8_mma_try_launch(d_mma, d_w, d_xq, d_xs,
+                                                  SC_IN, SC_OUT, SC_TOK,
+                                                  sc_blocks, sc_blocks,
+                                                  SC_OUT, 32u);
+        if (mma_rc > 0 && cudaDeviceSynchronize() == cudaSuccess) {
+            float ref[SC_TOK * SC_OUT];
+            float mma[SC_TOK * SC_OUT];
+            if (cudaMemcpy(ref, d_ref, sizeof(ref),
+                           cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(mma, d_mma, sizeof(mma),
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                ok = 1;
+                for (uint64_t i = 0; i < out_count; i++) {
+                    const float a = ref[i];
+                    const float b = mma[i];
+                    const float tol = 1e-3f + 1e-3f * fabsf(a);
+                    if (!(fabsf(a - b) <= tol)) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            }
+        } else if (mma_rc == 0) {
+            /* The MMA path declined this shape; nothing to verify. */
+            ok = 1;
+        }
+        (void)cudaGetLastError();
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (d_w) (void)cudaFree(d_w);
+    if (d_xq) (void)cudaFree(d_xq);
+    if (d_xs) (void)cudaFree(d_xs);
+    if (d_ref) (void)cudaFree(d_ref);
+    if (d_mma) (void)cudaFree(d_mma);
+    return ok;
+}
+
+static int cuda_q8_mma_verified(void) {
+    /* 0 = unchecked, 1 = trusted, -1 = failed (disable) */
+    static int state;
+    if (state == 0) {
+        /* Mark trusted during the nested self-check launch so the recursive
+         * cuda_q8_mma_try_launch call does not re-enter the check. */
+        state = 1;
+        const int rc = cuda_q8_mma_self_check_run();
+        if (rc != 1) {
+            state = -1;
+            fprintf(stderr,
+                    "ds4: CUDA Q8 tensor-core matmul %s the self-check; "
+                    "using exact kernels instead\n",
+                    rc == 0 ? "failed" : "could not run");
+        }
+    }
+    return state > 0;
+}
+
+static int cuda_q8_mma_try_launch(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks,
+        uint64_t a_stride_blocks,
+        uint64_t out_stride,
         uint32_t T) {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
     if (disabled || !cuda_q4_mma_ok()) return 0;
     if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
+    if (!cuda_q8_mma_verified()) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;
     const size_t shmem = (size_t)(64u * blocks * 2u + 16u * blocks * 4u);
     int dev = 0;

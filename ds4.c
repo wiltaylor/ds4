@@ -44078,6 +44078,13 @@ static bool glm_graph_forward_indexed_tokens(
                                                          DS4_RMS_EPS) != 0;
         DS4_GLM_PROFILE_INDEXED_STAGE("glm_indexed_attn", "attn_norm");
         if (ok) {
+            metal_graph_debug_dump_tensor("glm_indexed_attn_norm",
+                                          g->batch_attn_norm,
+                                          (uint64_t)n_tokens * DS4_N_EMBD,
+                                          il,
+                                          pos0);
+        }
+        if (ok) {
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_QPATH)) { /* ablate */ } else
             ok = (use_batch_q_rank_proj ?
                   glm_graph_matmul_q8_0_tensor(g->batch_q_rank,
@@ -44095,6 +44102,13 @@ static bool glm_graph_forward_indexed_tokens(
                                                     g->batch_attn_norm,
                                                     n_tokens));
         }
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_indexed_q_rank",
+                                          g->batch_q_rank,
+                                          (uint64_t)n_tokens * DS4_N_LORA_Q,
+                                          il,
+                                          pos0);
+        }
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_q_rank_norm,
                                                          g->batch_q_rank,
                                                          model->map,
@@ -44103,6 +44117,13 @@ static bool glm_graph_forward_indexed_tokens(
                                                          DS4_N_LORA_Q,
                                                          n_tokens,
                                                          DS4_RMS_EPS) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_indexed_q_rank_norm",
+                                          g->batch_q_rank_norm,
+                                          (uint64_t)n_tokens * DS4_N_LORA_Q,
+                                          il,
+                                          pos0);
+        }
         if (ok) {
             ok = (use_batch_q_proj ?
                   glm_graph_matmul_q8_0_tensor(g->batch_q,
@@ -45117,20 +45138,6 @@ static bool glm_graph_prefill_range(
                     return false;
                 }
             } else if (glm_graph_indexed_prefill_batch_ready(g, pos)) {
-#if !defined(DS4_ROCM_BUILD) && !defined(__APPLE__) && !defined(DS4_NO_GPU)
-                if (g->ssd_streaming) {
-                    static bool warned;
-                    if (!warned) {
-                        warned = true;
-                        fprintf(stderr,
-                                "ds4: WARNING: CUDA streaming indexed-batch "
-                                "prefill is known to corrupt the KV cache; "
-                                "expect garbage output (unset "
-                                "DS4_GLM_STREAMING_TOKEN_PREFILL_MAX to use "
-                                "the correct token-major path)\n");
-                    }
-                }
-#endif
                 chunk = remaining;
                 if (chunk > g->indexed_prefill_cap) chunk = g->indexed_prefill_cap;
                 chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
@@ -45293,15 +45300,6 @@ enum { DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS = 64 };
 static uint32_t glm_graph_streaming_token_prefill_default_max_tokens(void) {
 #ifdef DS4_ROCM_BUILD
     return 0;
-#elif !defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* CUDA: the indexed-batch streaming prefill produces corrupt KV -- a
-     * >64-token prompt decoded deterministic garbage ("</think> the the ...")
-     * on GB10 while the token-major path over the same prompt is coherent, on
-     * builds from 0d8b7ea through c848ab9.  Default to token-major for any
-     * prompt length until the indexed path is fixed on CUDA; it is slower
-     * (~1.3 vs ~4 tok/s prefill) but correct.  Override with
-     * DS4_GLM_STREAMING_TOKEN_PREFILL_MAX for debugging. */
-    return UINT32_MAX;
 #else
     return DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS;
 #endif
