@@ -383,6 +383,8 @@ typedef struct {
 
 static cuda_moe_decode_graph_cache g_moe_decode_graph[DS4_MAX_GPUS];
 
+static int cuda_q8_mma_verified(void);
+
 static int cuda_q4_mma_ok(void) {
     /* Cached once: all tiers on this host are the same GPU model. */
     static int cached = -1;
@@ -395,6 +397,17 @@ static int cuda_q4_mma_ok(void) {
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
             cached = (major > 7 || (major == 7 && minor >= 5)) ? 1 : 0;
+        }
+        /* The Q4 MoE MMA kernels ride the same WMMA int8 machinery the Q8
+         * kernel self-checks against the exact reference; on GB10 (sm_121)
+         * that machinery launches cleanly and computes nothing.  Until the
+         * Q4 kernels have a self-check of their own, treat the Q8 verdict
+         * as the arch's WMMA health canary. */
+        if (cached && !cuda_q8_mma_verified()) {
+            fprintf(stderr,
+                    "ds4: CUDA Q4 tensor-core MoE kernels disabled: the Q8 "
+                    "tensor-core self-check failed on this device\n");
+            cached = 0;
         }
     }
     return cached;
@@ -12783,6 +12796,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
         n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
+        /* Threshold verified on GB10: lowering it to 32 was measured 35%
+         * slower on a 121-token chunk than the exact batch kernels, so 128
+         * stays. */
         /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
          * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
          * re-reads the full weight per token (~30x the bytes at GLM dims).
