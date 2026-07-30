@@ -37588,15 +37588,18 @@ static double glm_graph_memory_guard_default_reserve_gib(
      * Unified-memory CUDA (GB10 class).  This reserve is held back in full, so
      * it should approximate what the OS and the untracked part of the graph
      * actually need rather than be a blanket margin.  Measured on a 121 GiB
-     * DGX Spark with GLM 5.2: a run holding 7000 experts is stable with
-     * 12.3 GiB free at its low-water mark, a 16 GiB reserve still left
-     * 21.8 GiB unused at the low-water mark, and 32 GiB left 30.7 GiB unused
-     * and cost ~1500 experts of hit rate.  The backstop against over-committing
+     * DGX Spark with GLM 5.2: 32 GiB left 30.7 GiB unused at the decode
+     * low-water mark and cost ~1500 experts of hit rate, so it is too
+     * conservative; 10 GiB was measured too aggressive -- it left only ~6 GiB
+     * available, and a 7k-token server prefill then exhausted memory badly
+     * enough that cuBLAS returned INTERNAL_ERROR mid-prefill.  Transient
+     * prefill scratch scales with the chunk size, so the reserve has to cover
+     * it, not just steady-state decode.  The backstop against over-committing
      * is not this number but the streaming cache's own free-memory trim
      * (DS4_CUDA_STREAM_FREE_RESERVE_GB), which sizes the slabs against actual
      * free memory when they are reserved.
      */
-    if (base_gib >= 96.0 && base_gib <= 200.0) return 10.0;
+    if (base_gib >= 96.0 && base_gib <= 200.0) return 16.0;
 #endif
     return 32.0;
 }
