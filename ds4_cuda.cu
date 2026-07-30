@@ -25762,6 +25762,164 @@ __global__ static void glm_attention_indexed_decode_kernel(
     }
 }
 
+/* ---------------- GEMM-based selected attention (decode) ----------------
+ *
+ * The per-head indexed decode kernel reads every selected row's compact KV
+ * twice per head (scores, then the weighted sum): 2 x n_head x rows x
+ * kv_lora_dim of cache traffic per layer, which the profile shows is what
+ * decode attention time is made of.  This path gathers the selected rows
+ * once into an f16 K/V panel and runs the score and value stages as two
+ * cuBLAS GEMMs, mirroring the ROCm backend's selected-attention GEMM
+ * (upstream ea2e766).  The f16 panel is a storage rounding of the f32
+ * cache, the same trade the ROCm and Metal paths already make.
+ * ------------------------------------------------------------------------- */
+
+__global__ static void glm_value_project_q8_0_batch_heads_kernel(
+        float *heads,
+        const char *weight,
+        const float *lora,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t value_dim,
+        uint64_t row_bytes);
+
+/* One block per selected row: K[s] = [kv_lora row | rope(k_rope row)] in
+ * f16, plus an additive score bias (-inf marker for out-of-range rows). */
+template <typename CT>
+__global__ static void glm_selected_gather_k_f16_kernel(
+        __half *k_panel,
+        float *score_bias,
+        const CT *kv_lora_cache,
+        const CT *k_rope_cache,
+        const uint32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t sidx = blockIdx.x;
+    if (sidx >= n_selected) return;
+    const uint32_t row = selected[sidx];
+    const uint32_t k_dim = kv_lora_dim + qk_rope;
+    __half *dst = k_panel + (uint64_t)sidx * k_dim;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    if (row >= cache_cap) {
+        for (uint32_t j = tid; j < k_dim; j += nth) dst[j] = __float2half(0.0f);
+        if (tid == 0) score_bias[sidx] = -1.0e30f;
+        return;
+    }
+    if (tid == 0) score_bias[sidx] = 0.0f;
+    const uint64_t lora_base = (uint64_t)row * kv_lora_dim;
+    for (uint32_t j = tid; j < kv_lora_dim; j += nth) {
+        dst[j] = __float2half((float)kv_lora_cache[lora_base + j]);
+    }
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        corr_dims[0] = fmaxf(0.0f,
+            floorf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_fast, freq_base)));
+        corr_dims[1] = fminf((float)qk_rope - 1.0f,
+            ceilf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_slow, freq_base)));
+    }
+    const uint64_t rope_base = (uint64_t)row * qk_rope;
+    for (uint32_t r = tid * 2u; r < qk_rope; r += nth * 2u) {
+        const float2 y = glm_cache_rope_pair_f16_dev<CT>(
+                k_rope_cache, rope_base, r, row, qk_rope,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                corr_dims);
+        dst[kv_lora_dim + r] = __float2half(y.x);
+        dst[kv_lora_dim + r + 1u] = __float2half(y.y);
+    }
+}
+
+/* One block per head: Q[h] = [qk_low row | rope part of q row] in f16. */
+__global__ static void glm_selected_pack_q_f16_kernel(
+        __half *q_panel,
+        const float *q,
+        const float *qk_low,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const uint32_t k_dim = kv_lora_dim + qk_rope;
+    const uint32_t qk_dim = qk_nope + qk_rope;
+    __half *dst = q_panel + (uint64_t)head * k_dim;
+    const float *low = qk_low + (uint64_t)head * kv_lora_dim;
+    const float *qh = q + (uint64_t)head * qk_dim;
+    for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {
+        dst[j] = __float2half(low[j]);
+    }
+    for (uint32_t r = threadIdx.x; r < qk_rope; r += blockDim.x) {
+        dst[kv_lora_dim + r] = __float2half(qh[qk_nope + r]);
+    }
+}
+
+/* One block per head: softmax over the score row (with bias), emitting
+ * normalized f16 probabilities for the value GEMM. */
+__global__ static void glm_selected_softmax_f16_kernel(
+        __half *p_panel,
+        const float *scores,
+        const float *score_bias,
+        uint32_t n_head,
+        uint32_t n_selected) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const float *src = scores + (uint64_t)head * n_selected;
+    __half *dst = p_panel + (uint64_t)head * n_selected;
+    __shared__ float red[256];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    float local_max = -FLT_MAX;
+    for (uint32_t s = tid; s < n_selected; s += nth) {
+        local_max = fmaxf(local_max, src[s] + score_bias[s]);
+    }
+    red[tid] = local_max;
+    __syncthreads();
+    for (uint32_t step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    const float max_score = red[0];
+    __syncthreads();
+    float local_sum = 0.0f;
+    for (uint32_t s = tid; s < n_selected; s += nth) {
+        local_sum += expf(src[s] + score_bias[s] - max_score);
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+    const float inv_denom = 1.0f / fmaxf(red[0], 1.0e-20f);
+    __syncthreads();
+    for (uint32_t s = tid; s < n_selected; s += nth) {
+        dst[s] = __float2half(expf(src[s] + score_bias[s] - max_score) *
+                              inv_denom);
+    }
+}
+
+static int cuda_glm_selected_attn_gemm_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_CUDA_GLM_SELECTED_ATTN_GEMM");
+        if (!env || !env[0]) env = getenv("DS4_ROCM_GLM_SELECTED_ATTN_GEMM");
+        cached = (env && !strcmp(env, "0")) ? 0 : 1;
+    }
+    return cached;
+}
+
 extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
@@ -25825,6 +25983,125 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
     if (!vw) return 0;
     const float scale = 1.0f / sqrtf((float)qk_dim);
     const bool score_vec2 = getenv("DS4_GLM_ATTN_NO_SCORE_VEC2") == NULL;
+    if (!g_glm_mtp_verify_mode &&
+        n_selected >= 256u &&
+        g_cublas_ready &&
+        cuda_glm_selected_attn_gemm_enabled()) {
+        const uint32_t k_dim = kv_lora_dim + qk_rope;
+        const uint64_t k_bytes = (uint64_t)n_selected * k_dim * sizeof(__half);
+        const uint64_t qp_off = (k_bytes + 255u) & ~255ull;
+        const uint64_t qp_bytes = (uint64_t)n_head * k_dim * sizeof(__half);
+        const uint64_t bias_off = (qp_off + qp_bytes + 255u) & ~255ull;
+        const uint64_t bias_bytes = (uint64_t)n_selected * sizeof(float);
+        const uint64_t s_off = (bias_off + bias_bytes + 255u) & ~255ull;
+        const uint64_t s_bytes =
+            (uint64_t)n_head * n_selected * sizeof(float);
+        const uint64_t p_off = (s_off + s_bytes + 255u) & ~255ull;
+        const uint64_t p_bytes =
+            (uint64_t)n_head * n_selected * sizeof(__half);
+        const uint64_t l_off = (p_off + p_bytes + 255u) & ~255ull;
+        const uint64_t l_bytes =
+            (uint64_t)n_head * kv_lora_dim * sizeof(float);
+        char *scratch = (char *)cuda_tmp_alloc_on(
+                logical_tier, l_off + l_bytes, "glm selected attn gemm");
+        if (scratch) {
+            __half *k_panel = (__half *)scratch;
+            __half *q_panel = (__half *)(scratch + qp_off);
+            float *score_bias = (float *)(scratch + bias_off);
+            float *s_panel = (float *)(scratch + s_off);
+            __half *p_panel = (__half *)(scratch + p_off);
+            float *l_panel = (float *)(scratch + l_off);
+            if (cache_f16) {
+                glm_selected_gather_k_f16_kernel<__half>
+                        <<<n_selected, 128>>>(
+                        k_panel, score_bias,
+                        (const __half *)kv_lora_cache->ptr,
+                        (const __half *)k_rope_cache->ptr,
+                        (const uint32_t *)selected->ptr,
+                        n_selected, cache_cap, kv_lora_dim, qk_rope,
+                        n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow);
+            } else {
+                glm_selected_gather_k_f16_kernel<float>
+                        <<<n_selected, 128>>>(
+                        k_panel, score_bias,
+                        (const float *)kv_lora_cache->ptr,
+                        (const float *)k_rope_cache->ptr,
+                        (const uint32_t *)selected->ptr,
+                        n_selected, cache_cap, kv_lora_dim, qk_rope,
+                        n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow);
+            }
+            glm_selected_pack_q_f16_kernel<<<n_head, 128>>>(
+                    q_panel, (const float *)q->ptr,
+                    (const float *)qk_low->ptr,
+                    n_head, kv_lora_dim, qk_nope, qk_rope);
+            int gemm_ok = cuda_ok(cudaGetLastError(),
+                                  "glm selected attn gather launch");
+            if (gemm_ok) {
+                /* Row-major S[n_head, rows] = scale * Q x K^T. */
+                const float beta = 0.0f;
+                cublasStatus_t st = cublasGemmEx(
+                        cuda_cublas_for_tier(logical_tier),
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        (int)n_selected, (int)n_head, (int)k_dim,
+                        &scale,
+                        k_panel, CUDA_R_16F, (int)k_dim,
+                        q_panel, CUDA_R_16F, (int)k_dim,
+                        &beta,
+                        s_panel, CUDA_R_32F, (int)n_selected,
+                        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+                gemm_ok = st == CUBLAS_STATUS_SUCCESS;
+                if (!gemm_ok) {
+                    fprintf(stderr,
+                            "ds4: glm selected attn score GEMM failed: "
+                            "status %d\n", (int)st);
+                }
+            }
+            if (gemm_ok) {
+                glm_selected_softmax_f16_kernel<<<n_head, 256>>>(
+                        p_panel, s_panel, score_bias, n_head, n_selected);
+                gemm_ok = cuda_ok(cudaGetLastError(),
+                                  "glm selected attn softmax launch");
+            }
+            if (gemm_ok) {
+                /* Row-major L[n_head, kv_lora_dim] = P x V, where V is the
+                 * lora half of the K panel (leading kv_lora_dim columns,
+                 * stride k_dim). */
+                const float alpha1 = 1.0f;
+                const float beta = 0.0f;
+                cublasStatus_t st = cublasGemmEx(
+                        cuda_cublas_for_tier(logical_tier),
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        (int)kv_lora_dim, (int)n_head, (int)n_selected,
+                        &alpha1,
+                        k_panel, CUDA_R_16F, (int)k_dim,
+                        p_panel, CUDA_R_16F, (int)n_selected,
+                        &beta,
+                        l_panel, CUDA_R_32F, (int)kv_lora_dim,
+                        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+                gemm_ok = st == CUBLAS_STATUS_SUCCESS;
+                if (!gemm_ok) {
+                    fprintf(stderr,
+                            "ds4: glm selected attn value GEMM failed: "
+                            "status %d\n", (int)st);
+                }
+            }
+            if (gemm_ok) {
+                const uint32_t shmem =
+                        kv_lora_dim * (uint32_t)sizeof(float);
+                glm_value_project_q8_0_batch_heads_kernel
+                        <<<dim3(n_head, 1u), 128, shmem>>>(
+                        (float *)heads->ptr, vw, l_panel,
+                        1u, n_head, kv_lora_dim, value_dim,
+                        (uint64_t)value_row_bytes);
+                gemm_ok = cuda_ok(cudaGetLastError(),
+                                  "glm selected attn value project launch");
+            }
+            if (gemm_ok) return 1;
+            /* Any failure falls through to the reference kernels. */
+        }
+    }
     const bool range_tok2 =
         g_glm_mtp_verify_mode &&
         getenv("DS4_GLM_MTP_NO_ATTN_TOK2") == NULL &&
