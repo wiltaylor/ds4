@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <deque>
+#include <new>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -260,10 +262,20 @@ struct cuda_stream_resident_key_hash {
     }
 };
 
+typedef struct cuda_stream_read_batch cuda_stream_read_batch;
+
 typedef struct {
     cuda_stream_resident_key key;
     uint32_t                 slot;
     uint64_t                 last_used;
+    /* Saturating per-entry reuse count; the frequency-biased eviction
+     * experiment (DS4_CUDA_STREAM_EVICT_FREQ_BOOST) scores victims by
+     * last_used + uses * boost so globally hot experts survive transient
+     * eviction pressure from the selection tail. */
+    uint32_t                 uses;
+    /* Non-NULL while this slot's bytes are still being read by the pool.
+     * Such an entry must not be evicted or consumed until the batch lands. */
+    cuda_stream_read_batch  *batch;
 } cuda_stream_resident_expert;
 
 /* One contiguous device allocation per projection; slot i of each covers the
@@ -290,6 +302,12 @@ static std::unordered_map<cuda_stream_resident_key,
     g_stream_resident_index;
 static std::vector<uint32_t> g_stream_resident_free_slots;
 static uint64_t g_stream_resident_clock;
+/* Entries touched after this clock value belong to the demand call still in
+ * flight: their slot ids are (or are about to be) uploaded for a kernel that
+ * has not launched yet, so no eviction -- demand or prefetch -- may recycle
+ * them.  Reset at each demand begin, when the previous layer's launch has
+ * already consumed its slots. */
+static uint64_t g_stream_resident_protect_clock;
 /* Budget in experts, as configured by ds4.c from the SSD auto-cache plan or
  * an explicit --ssd-streaming-cache-experts.  0 disables the cache. */
 static uint32_t g_stream_expert_cache_budget;
@@ -328,6 +346,8 @@ static uint32_t g_stream_cache_layer_misses[CUDA_STREAM_STATS_MAX_LAYER];
 
 static void cuda_stream_resident_cache_release(void);
 static void cuda_stream_resident_note_use(void);
+static void cuda_stream_outstanding_wait_all(void);
+static int cuda_stream_selected_finish_pending(void);
 
 typedef struct {
     cudaGraph_t     graph;
@@ -1780,11 +1800,18 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 
 enum { CUDA_STREAM_READ_WORKERS_MAX = 16 };
 
-typedef struct {
-    char    *dst;
-    uint64_t offset;
-    uint64_t bytes;
+/* Every submitted job belongs to a batch; the batch is the unit of completion
+ * and of success/failure.  `pending` and `ok` are guarded by the pool mutex. */
+struct cuda_stream_read_batch {
+    uint32_t pending;
     int      ok;
+};
+
+typedef struct {
+    char                   *dst;
+    uint64_t                offset;
+    uint64_t                bytes;
+    cuda_stream_read_batch *batch;
 } cuda_stream_read_job;
 
 static void            *g_stream_read_stage_raw[CUDA_STREAM_READ_WORKERS_MAX];
@@ -1799,11 +1826,10 @@ static int              g_stream_read_pool_stop;
 static pthread_mutex_t  g_stream_read_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_stream_read_work_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t   g_stream_read_done_cond = PTHREAD_COND_INITIALIZER;
-static cuda_stream_read_job *g_stream_read_jobs;
-static uint32_t         g_stream_read_job_count;
-static uint32_t         g_stream_read_job_next;
-static uint32_t         g_stream_read_job_done;
-static int              g_stream_read_batch_ok;
+/* Two-priority queues: demand jobs (the routed-MoE launch is waiting on them)
+ * are always taken before prefetch jobs (speculative, hiding under compute). */
+static std::deque<cuda_stream_read_job> g_stream_read_qdemand;
+static std::deque<cuda_stream_read_job> g_stream_read_qprefetch;
 
 static uint32_t cuda_stream_read_worker_target(void) {
     static int cached = -1;
@@ -1826,15 +1852,16 @@ static uint32_t cuda_stream_read_worker_target(void) {
     return (uint32_t)cached;
 }
 
-/* Runs one job on this worker's private staging buffer and stream. */
-static void cuda_stream_read_job_run(cuda_stream_read_job *job, uint32_t worker) {
-    job->ok = 0;
-    if (!job->dst || job->bytes == 0 || g_model_fd < 0) return;
+/* Runs one job on this worker's private staging buffer and stream.
+ * Returns 1 on success. */
+static int cuda_stream_read_job_run(const cuda_stream_read_job *job,
+                                    uint32_t worker) {
+    if (!job->dst || job->bytes == 0 || g_model_fd < 0) return 0;
     const char *payload = NULL;
     if (!cuda_model_stage_read(g_stream_read_stage[worker],
                                g_stream_read_stage_bytes,
                                job->offset, job->bytes, &payload)) {
-        return;
+        return 0;
     }
     cudaError_t err = cudaMemcpyAsync(job->dst, payload, (size_t)job->bytes,
                                       cudaMemcpyHostToDevice,
@@ -1844,12 +1871,12 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job, uint32_t worker)
     }
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        return;
+        return 0;
     }
     /* O_DIRECT never populated the page cache, so only the buffered path
      * needs the source pages dropped. */
     if (g_model_direct_fd < 0) cuda_model_drop_file_pages(job->offset, job->bytes);
-    job->ok = 1;
+    return 1;
 }
 
 static void *cuda_stream_read_worker(void *arg) {
@@ -1858,31 +1885,100 @@ static void *cuda_stream_read_worker(void *arg) {
     pthread_mutex_lock(&g_stream_read_mutex);
     for (;;) {
         while (!g_stream_read_pool_stop &&
-               g_stream_read_job_next >= g_stream_read_job_count) {
+               g_stream_read_qdemand.empty() &&
+               g_stream_read_qprefetch.empty()) {
             pthread_cond_wait(&g_stream_read_work_cond, &g_stream_read_mutex);
         }
         if (g_stream_read_pool_stop) break;
-        const uint32_t idx = g_stream_read_job_next++;
+        cuda_stream_read_job job;
+        if (!g_stream_read_qdemand.empty()) {
+            job = g_stream_read_qdemand.front();
+            g_stream_read_qdemand.pop_front();
+        } else {
+            job = g_stream_read_qprefetch.front();
+            g_stream_read_qprefetch.pop_front();
+        }
         pthread_mutex_unlock(&g_stream_read_mutex);
 
-        cuda_stream_read_job *job = &g_stream_read_jobs[idx];
-        cuda_stream_read_job_run(job, worker);
+        const int ok = cuda_stream_read_job_run(&job, worker);
 
         pthread_mutex_lock(&g_stream_read_mutex);
-        if (!job->ok) g_stream_read_batch_ok = 0;
-        if (++g_stream_read_job_done == g_stream_read_job_count) {
-            pthread_cond_broadcast(&g_stream_read_done_cond);
+        if (job.batch) {
+            if (!ok) job.batch->ok = 0;
+            if (job.batch->pending != 0 && --job.batch->pending == 0) {
+                pthread_cond_broadcast(&g_stream_read_done_cond);
+            }
         }
     }
     pthread_mutex_unlock(&g_stream_read_mutex);
     return NULL;
 }
 
+/* Queue a set of jobs under one batch without waiting.  The jobs are copied;
+ * the batch object must stay alive until cuda_stream_read_batch_wait. */
+static int cuda_stream_read_jobs_submit(const cuda_stream_read_job *jobs,
+                                        uint32_t count,
+                                        cuda_stream_read_batch *batch,
+                                        int prefetch) {
+    if (count == 0) return 1;
+    if (!jobs || !batch) return 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    int ok = 1;
+    try {
+        for (uint32_t i = 0; i < count; i++) {
+            cuda_stream_read_job j = jobs[i];
+            j.batch = batch;
+            if (prefetch) g_stream_read_qprefetch.push_back(j);
+            else g_stream_read_qdemand.push_back(j);
+            batch->pending++;
+        }
+    } catch (...) {
+        ok = 0;
+    }
+    pthread_cond_broadcast(&g_stream_read_work_cond);
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return ok;
+}
+
+/* Wait for a batch to drain.  Returns the batch's success flag. */
+static int cuda_stream_read_batch_wait(cuda_stream_read_batch *batch) {
+    if (!batch) return 0;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    while (batch->pending != 0) {
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    const int ok = batch->ok;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return ok;
+}
+
+/* Non-blocking completion check. */
+static int cuda_stream_read_batch_done(cuda_stream_read_batch *batch) {
+    if (!batch) return 1;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    const int done = batch->pending == 0;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return done;
+}
+
 static void cuda_stream_read_pool_shutdown(void) {
     if (g_stream_read_pool_started) {
         pthread_mutex_lock(&g_stream_read_mutex);
         g_stream_read_pool_stop = 1;
+        /* Nothing may wait on these batches after shutdown; account them as
+         * drained-and-failed so a stray wait cannot hang. */
+        for (std::deque<cuda_stream_read_job> *q :
+                 {&g_stream_read_qdemand, &g_stream_read_qprefetch}) {
+            for (const cuda_stream_read_job &j : *q) {
+                if (j.batch) {
+                    j.batch->ok = 0;
+                    if (j.batch->pending != 0) j.batch->pending--;
+                }
+            }
+            q->clear();
+        }
         pthread_cond_broadcast(&g_stream_read_work_cond);
+        pthread_cond_broadcast(&g_stream_read_done_cond);
         pthread_mutex_unlock(&g_stream_read_mutex);
         for (uint32_t i = 0; i < g_stream_read_workers; i++) {
             (void)pthread_join(g_stream_read_threads[i], NULL);
@@ -1936,10 +2032,6 @@ static int cuda_stream_read_pool_ensure(uint64_t max_job_bytes) {
         return 0;
     }
     g_stream_read_stage_bytes = need;
-
-    g_stream_read_job_count = 0;
-    g_stream_read_job_next = 0;
-    g_stream_read_job_done = 0;
     g_stream_read_pool_stop = 0;
     for (uint32_t i = 0; i < g_stream_read_workers; i++) {
         g_stream_read_worker_ids[i] = i;
@@ -1975,24 +2067,14 @@ static int cuda_stream_read_jobs_parallel(cuda_stream_read_job *jobs,
         if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
     }
     if (!cuda_stream_read_pool_ensure(max_bytes)) return 0;
-
-    pthread_mutex_lock(&g_stream_read_mutex);
-    g_stream_read_jobs = jobs;
-    g_stream_read_job_count = count;
-    g_stream_read_job_next = 0;
-    g_stream_read_job_done = 0;
-    g_stream_read_batch_ok = 1;
-    pthread_cond_broadcast(&g_stream_read_work_cond);
-    while (g_stream_read_job_done < g_stream_read_job_count) {
-        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    cuda_stream_read_batch batch;
+    batch.pending = 0;
+    batch.ok = 1;
+    if (!cuda_stream_read_jobs_submit(jobs, count, &batch, 0)) {
+        (void)cuda_stream_read_batch_wait(&batch);
+        return 0;
     }
-    const int ok = g_stream_read_batch_ok;
-    g_stream_read_jobs = NULL;
-    g_stream_read_job_count = 0;
-    g_stream_read_job_next = 0;
-    g_stream_read_job_done = 0;
-    pthread_mutex_unlock(&g_stream_read_mutex);
-    return ok;
+    return cuda_stream_read_batch_wait(&batch);
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -21296,6 +21378,13 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
+    if (g_ssd_streaming_mode && allow_streaming &&
+        !cuda_stream_selected_finish_pending()) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected expert load failed for layer %u\n",
+                layer_index);
+        return 0;
+    }
     const int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
@@ -23556,6 +23645,7 @@ static void cuda_stream_resident_note_use(void) {
 }
 
 static void cuda_stream_resident_cache_release(void) {
+    cuda_stream_outstanding_wait_all();
     (void)cuda_stream_resident_reclaim_wait("resident expert cache release");
     /* The selected-cache descriptor may still point into the slabs. */
     if (g_stream_selected_cache.resident_slots) {
@@ -23759,6 +23849,7 @@ static int cuda_stream_resident_find(const cuda_stream_resident_key &key) {
     }
     cuda_stream_resident_expert &e = g_stream_resident_experts[it->second];
     e.last_used = ++g_stream_resident_clock;
+    if (e.uses < UINT32_MAX) e.uses++;
     return (int)e.slot;
 }
 
@@ -23781,15 +23872,38 @@ static void cuda_stream_resident_evict_at(size_t idx) {
  * would free a slot we are about to refill, and worse, one a queued kernel
  * may still read.
  */
+/* One reference tick is one expert lookup; a full token is roughly
+ * layers x experts-used of them, so a boost of ~600 weighs one reuse like one
+ * token of recency.  0 keeps pure LRU. */
+static uint64_t cuda_stream_evict_freq_boost(void) {
+    static int64_t cached = -1;
+    if (cached < 0) {
+        uint64_t v = 0;
+        const char *env = getenv("DS4_CUDA_STREAM_EVICT_FREQ_BOOST");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long b = strtoull(env, &end, 10);
+            if (end != env && *end == '\0' && b <= 1000000ull) v = (uint64_t)b;
+        }
+        cached = (int64_t)v;
+    }
+    return (uint64_t)cached;
+}
+
 static int cuda_stream_resident_evict_one(const int32_t *protect,
                                           uint32_t n_protect,
                                           uint32_t layer,
                                           int past_layers_first) {
+    const uint64_t freq_boost = cuda_stream_evict_freq_boost();
     size_t victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
     for (int pass = past_layers_first ? 0 : 1; pass < 2; pass++) {
         for (size_t i = 0; i < g_stream_resident_experts.size(); i++) {
             const cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+            /* A slot with reads still landing must not be recycled. */
+            if (e.batch != NULL) continue;
+            /* Neither may one the in-flight demand call has referenced. */
+            if (e.last_used > g_stream_resident_protect_clock) continue;
             if (pass == 0 && e.key.layer > layer) continue;
             int protected_entry = 0;
             if (e.key.layer == layer) {
@@ -23801,8 +23915,13 @@ static int cuda_stream_resident_evict_one(const int32_t *protect,
                 }
             }
             if (protected_entry) continue;
-            if (e.last_used < oldest) {
-                oldest = e.last_used;
+            uint64_t score = e.last_used;
+            if (freq_boost != 0) {
+                const uint64_t uses = e.uses < 4096u ? e.uses : 4096u;
+                score += uses * freq_boost;
+            }
+            if (score < oldest) {
+                oldest = score;
                 victim = i;
             }
         }
@@ -23841,6 +23960,8 @@ static int cuda_stream_resident_admit(const cuda_stream_resident_key &key,
     e.key = key;
     e.slot = slot;
     e.last_used = ++g_stream_resident_clock;
+    e.uses = 1;
+    e.batch = NULL;
     try {
         g_stream_resident_experts.push_back(e);
         g_stream_resident_index[key] = g_stream_resident_experts.size() - 1u;
@@ -23870,6 +23991,121 @@ static void cuda_stream_resident_abandon(const cuda_stream_resident_key &key) {
         cuda_stream_resident_evict_at(it->second);
     }
 }
+
+/* --------------------------- in-flight expert loads ---------------------------
+ *
+ * Demand loads are two-phase: begin() admits slots and queues the reads,
+ * then returns so the caller can keep encoding GPU work; the routed-MoE
+ * entry waits for the batch only when it is about to launch.  In decode the
+ * window between the two is small (the shared-expert encode), but any caller
+ * that can put work between selection and consumption gets the reads for
+ * free.
+ *
+ * A speculative cross-layer prefetch was tried here and measured useless by
+ * construction: predicting from the previous token's selections only ever
+ * names experts the LRU still holds (that recency IS the cache's hit rate),
+ * so it admitted nothing.  Do not re-add it without a predictor that carries
+ * information the cache does not already have -- e.g. running a layer's
+ * router early on an approximate hidden state.
+ * ---------------------------------------------------------------------------- */
+
+/* Batches with reads still outstanding.  Owned by the main thread; the pool
+ * workers only decrement pending/ok under the pool mutex. */
+static std::vector<cuda_stream_read_batch *> g_stream_outstanding_batches;
+
+typedef struct {
+    int active;
+    /* Everything this call depends on: its own demand batch (may be NULL when
+     * every expert was already resident) plus any prefetch batches that were
+     * still in flight for experts this call hit. */
+    std::vector<cuda_stream_read_batch *> waits;
+    ds4_gpu_stream_expert_table table;
+    std::vector<int32_t> miss_experts;
+    double begin_t0;
+} cuda_stream_selected_pending_state;
+static cuda_stream_selected_pending_state g_stream_selected_pending;
+
+/* Clear the in-flight mark of every resident entry tied to `batch`; if the
+ * batch failed, drop those entries so a garbage slot is never served. */
+static void cuda_stream_resident_settle_batch(cuda_stream_read_batch *batch,
+                                              int ok) {
+    for (size_t i = g_stream_resident_experts.size(); i-- != 0; ) {
+        cuda_stream_resident_expert &e = g_stream_resident_experts[i];
+        if (e.batch != batch) continue;
+        e.batch = NULL;
+        if (!ok) cuda_stream_resident_evict_at(i);
+    }
+}
+
+static void cuda_stream_outstanding_remove(cuda_stream_read_batch *batch) {
+    for (size_t i = 0; i < g_stream_outstanding_batches.size(); i++) {
+        if (g_stream_outstanding_batches[i] == batch) {
+            g_stream_outstanding_batches[i] = g_stream_outstanding_batches.back();
+            g_stream_outstanding_batches.pop_back();
+            return;
+        }
+    }
+}
+
+/* Wait one batch, settle its entries, free it.  Returns its success. */
+static int cuda_stream_outstanding_finish_one(cuda_stream_read_batch *batch) {
+    const int ok = cuda_stream_read_batch_wait(batch);
+    cuda_stream_resident_settle_batch(batch, ok);
+    cuda_stream_outstanding_remove(batch);
+    delete batch;
+    return ok;
+}
+
+/* Reap batches that have already drained, without blocking. */
+static void cuda_stream_outstanding_reap(void) {
+    for (size_t i = g_stream_outstanding_batches.size(); i-- != 0; ) {
+        cuda_stream_read_batch *b = g_stream_outstanding_batches[i];
+        if (!cuda_stream_read_batch_done(b)) continue;
+        (void)cuda_stream_outstanding_finish_one(b);
+    }
+}
+
+static void cuda_stream_outstanding_wait_all(void) {
+    while (!g_stream_outstanding_batches.empty()) {
+        (void)cuda_stream_outstanding_finish_one(
+                g_stream_outstanding_batches.back());
+    }
+    g_stream_selected_pending.active = 0;
+    g_stream_selected_pending.waits.clear();
+    g_stream_selected_pending.miss_experts.clear();
+}
+
+/* Complete a pending two-phase demand load.  Cheap no-op when none is
+ * pending; on failure the selected-cache descriptor is invalidated so the
+ * consumer's match fails loudly instead of running on garbage. */
+static int cuda_stream_selected_finish_pending(void) {
+    if (!g_stream_selected_pending.active) return 1;
+    g_stream_selected_pending.active = 0;
+    int ok = 1;
+    const int stats_on = cuda_stream_cache_stats_on();
+    const double t0 = stats_on ? cuda_wall_sec() : 0.0;
+    for (cuda_stream_read_batch *b : g_stream_selected_pending.waits) {
+        if (!cuda_stream_outstanding_finish_one(b)) ok = 0;
+    }
+    if (stats_on) {
+        /* Only the tail that was still outstanding at consume time counts as
+         * stall; the overlapped span is the whole point. */
+        g_stream_cache_stats.miss_read_sec += cuda_wall_sec() - t0;
+    }
+    g_stream_selected_pending.waits.clear();
+    if (!ok) {
+        /* settle already dropped the failed batch's entries; drop the rest of
+         * this call's misses too so no half-loaded state survives. */
+        for (int32_t e : g_stream_selected_pending.miss_experts) {
+            cuda_stream_resident_abandon(cuda_stream_resident_make_key(
+                    &g_stream_selected_pending.table, e));
+        }
+        cuda_stream_selected_cache_invalidate();
+    }
+    g_stream_selected_pending.miss_experts.clear();
+    return ok;
+}
+
 
 /*
  * Load this call's selected experts into the persistent resident cache and
@@ -23927,20 +24163,51 @@ static int cuda_stream_selected_resident_load(
         }
     }
 
+    /* Finish any pending load a failed consumer left behind, and reap
+     * prefetch batches that have already drained (clears their in-flight
+     * marks without blocking). */
+    (void)cuda_stream_selected_finish_pending();
+    cuda_stream_outstanding_reap();
+    /* Everything referenced from here on is protected from eviction until the
+     * next demand call: the previous layer's launch has consumed its slots,
+     * so only this call's entries need the shield. */
+    g_stream_resident_protect_clock = g_stream_resident_clock;
+
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.calls++;
         g_stream_cache_stats.slots += slot_count;
     }
 
-    /* Admit misses, remembering which ones still need bytes. */
+    /* Admit misses, remembering which ones still need bytes.  A hit whose
+     * prefetch is still in flight is usable -- the finish step just has to
+     * wait on that batch too. */
     std::vector<uint32_t> miss_slots;
     std::vector<int32_t> miss_experts;
+    std::vector<cuda_stream_read_batch *> waits;
     for (size_t u = 0; u < unique_ids.size(); u++) {
         const cuda_stream_resident_key key =
             cuda_stream_resident_make_key(table, unique_ids[u]);
         const int found = cuda_stream_resident_find(key);
         cuda_stream_cache_stats_note_lookup(table->layer, found >= 0);
-        if (found >= 0) continue;
+        if (found >= 0) {
+            const auto it = g_stream_resident_index.find(key);
+            cuda_stream_read_batch *b =
+                g_stream_resident_experts[it->second].batch;
+            if (b) {
+                int listed = 0;
+                for (cuda_stream_read_batch *w : waits) {
+                    if (w == b) { listed = 1; break; }
+                }
+                if (!listed) {
+                    try {
+                        waits.push_back(b);
+                    } catch (...) {
+                        return 0;
+                    }
+                }
+            }
+            continue;
+        }
         const int slot = cuda_stream_resident_admit(key,
                                                     unique_ids.data(),
                                                     (uint32_t)unique_ids.size());
@@ -23967,25 +24234,27 @@ static int cuda_stream_selected_resident_load(
     }
 
     const int stats_on = cuda_stream_cache_stats_on();
-    const double miss_t0 = stats_on && !miss_slots.empty() ? cuda_wall_sec() : 0.0;
-    if (!miss_slots.empty()) {
-        /*
-         * Read all three projections of every missing expert concurrently.
-         * The serial fallback below is kept for the case where the pool cannot
-         * start (no fd, or pinned staging unavailable).
-         */
-        int loaded = 0;
-        const int use_fd = g_model_fd >= 0 &&
-            (g_model_fd_host_base == NULL ||
-             table->model_map == g_model_fd_host_base);
-        if (use_fd) {
-            std::vector<cuda_stream_read_job> jobs;
+    const int use_fd = g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL ||
+         table->model_map == g_model_fd_host_base);
+    if (!miss_slots.empty() && use_fd &&
+        cuda_stream_read_pool_ensure(table->gate_expert_bytes >
+                                             table->down_expert_bytes ?
+                                         table->gate_expert_bytes :
+                                         table->down_expert_bytes)) {
+        /* In-flight path: queue every missing projection and return without
+         * waiting.  The consumer's finish() blocks only when the weights are
+         * actually about to be used, so the GPU keeps executing whatever the
+         * caller encodes in between. */
+        std::vector<cuda_stream_read_job> jobs;
+        cuda_stream_read_batch *batch = new (std::nothrow) cuda_stream_read_batch;
+        int submitted = 0;
+        if (batch) {
+            batch->pending = 0;
+            batch->ok = 1;
             try {
                 jobs.reserve(miss_slots.size() * 3u);
-            } catch (...) {
-                jobs.clear();
-            }
-            if (jobs.capacity() >= miss_slots.size() * 3u) {
+                g_stream_outstanding_batches.push_back(batch);
                 for (size_t m = 0; m < miss_slots.size(); m++) {
                     const uint64_t e = (uint64_t)(uint32_t)miss_experts[m];
                     const uint32_t slot = miss_slots[m];
@@ -23993,56 +24262,93 @@ static int cuda_stream_selected_resident_load(
                     const uint64_t d_rel = e * table->down_expert_bytes;
                     jobs.push_back({cuda_stream_resident_gate_ptr(slot),
                                     table->gate_offset + g_rel,
-                                    table->gate_expert_bytes, 0});
+                                    table->gate_expert_bytes, NULL});
                     jobs.push_back({cuda_stream_resident_up_ptr(slot),
                                     table->up_offset + g_rel,
-                                    table->gate_expert_bytes, 0});
+                                    table->gate_expert_bytes, NULL});
                     jobs.push_back({cuda_stream_resident_down_ptr(slot),
                                     table->down_offset + d_rel,
-                                    table->down_expert_bytes, 0});
+                                    table->down_expert_bytes, NULL});
+                    const auto it = g_stream_resident_index.find(
+                            cuda_stream_resident_make_key(table,
+                                                          miss_experts[m]));
+                    g_stream_resident_experts[it->second].batch = batch;
                 }
-                loaded = cuda_stream_read_jobs_parallel(jobs.data(),
-                                                        (uint32_t)jobs.size());
+                submitted = cuda_stream_read_jobs_submit(
+                        jobs.data(), (uint32_t)jobs.size(), batch, 0);
+            } catch (...) {
+                submitted = 0;
+            }
+            if (!submitted) {
+                (void)cuda_stream_read_batch_wait(batch);
+                cuda_stream_resident_settle_batch(batch, 0);
+                cuda_stream_outstanding_remove(batch);
+                delete batch;
+                batch = NULL;
             }
         }
-        if (!loaded) {
-            for (size_t m = 0; m < miss_slots.size(); m++) {
-                const uint64_t expert = (uint64_t)(uint32_t)miss_experts[m];
-                const uint32_t slot = miss_slots[m];
-                if (!cuda_model_copy_to_device_streamed(
-                            cuda_stream_resident_gate_ptr(slot),
-                            table->model_map, table->model_size,
-                            table->gate_offset + expert * table->gate_expert_bytes,
-                            table->gate_expert_bytes,
-                            "resident gate expert copy") ||
-                    !cuda_model_copy_to_device_streamed(
-                            cuda_stream_resident_up_ptr(slot),
-                            table->model_map, table->model_size,
-                            table->up_offset + expert * table->gate_expert_bytes,
-                            table->gate_expert_bytes,
-                            "resident up expert copy") ||
-                    !cuda_model_copy_to_device_streamed(
-                            cuda_stream_resident_down_ptr(slot),
-                            table->model_map, table->model_size,
-                            table->down_offset + expert * table->down_expert_bytes,
-                            table->down_expert_bytes,
-                            "resident down expert copy")) {
-                    for (size_t f = 0; f < miss_experts.size(); f++) {
-                        cuda_stream_resident_abandon(
-                                cuda_stream_resident_make_key(table,
-                                                              miss_experts[f]));
-                    }
-                    return 0;
+        if (!submitted) {
+            for (size_t f = 0; f < miss_experts.size(); f++) {
+                cuda_stream_resident_abandon(
+                        cuda_stream_resident_make_key(table, miss_experts[f]));
+            }
+            return 0;
+        }
+        try {
+            waits.push_back(batch);
+        } catch (...) {
+            (void)cuda_stream_outstanding_finish_one(batch);
+            for (size_t f = 0; f < miss_experts.size(); f++) {
+                cuda_stream_resident_abandon(
+                        cuda_stream_resident_make_key(table, miss_experts[f]));
+            }
+            return 0;
+        }
+        if (stats_on) {
+            g_stream_cache_stats.miss_bytes +=
+                (uint64_t)miss_slots.size() *
+                (2u * table->gate_expert_bytes + table->down_expert_bytes);
+        }
+    } else if (!miss_slots.empty()) {
+        /* Serial fallback: no usable fd or no pool.  Synchronous, as before. */
+        const double miss_t0 = stats_on ? cuda_wall_sec() : 0.0;
+        for (size_t m = 0; m < miss_slots.size(); m++) {
+            const uint64_t expert = (uint64_t)(uint32_t)miss_experts[m];
+            const uint32_t slot = miss_slots[m];
+            if (!cuda_model_copy_to_device_streamed(
+                        cuda_stream_resident_gate_ptr(slot),
+                        table->model_map, table->model_size,
+                        table->gate_offset + expert * table->gate_expert_bytes,
+                        table->gate_expert_bytes,
+                        "resident gate expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        cuda_stream_resident_up_ptr(slot),
+                        table->model_map, table->model_size,
+                        table->up_offset + expert * table->gate_expert_bytes,
+                        table->gate_expert_bytes,
+                        "resident up expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        cuda_stream_resident_down_ptr(slot),
+                        table->model_map, table->model_size,
+                        table->down_offset + expert * table->down_expert_bytes,
+                        table->down_expert_bytes,
+                        "resident down expert copy")) {
+                for (size_t f = 0; f < miss_experts.size(); f++) {
+                    cuda_stream_resident_abandon(
+                            cuda_stream_resident_make_key(table,
+                                                          miss_experts[f]));
                 }
+                return 0;
             }
         }
+        if (stats_on) {
+            g_stream_cache_stats.miss_read_sec += cuda_wall_sec() - miss_t0;
+            g_stream_cache_stats.miss_bytes +=
+                (uint64_t)miss_slots.size() *
+                (2u * table->gate_expert_bytes + table->down_expert_bytes);
+        }
     }
-    if (stats_on && !miss_slots.empty()) {
-        g_stream_cache_stats.miss_read_sec += cuda_wall_sec() - miss_t0;
-        g_stream_cache_stats.miss_bytes +=
-            (uint64_t)miss_slots.size() *
-            (2u * table->gate_expert_bytes + table->down_expert_bytes);
-    }
+
 
     /* Every expert is resident now; map each call slot to its slab slot. */
     for (uint32_t i = 0; i < slot_count; i++) {
@@ -24088,6 +24394,16 @@ static int cuda_stream_selected_resident_load(
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
     g_stream_selected_cache.valid = 1;
+    /* Reads may still be in flight; the consumer completes them through
+     * cuda_stream_selected_finish_pending() right before the launch. */
+    if (!waits.empty()) {
+        const double pend_t0 = stats_on ? cuda_wall_sec() : 0.0;
+        g_stream_selected_pending.active = 1;
+        g_stream_selected_pending.waits.swap(waits);
+        g_stream_selected_pending.table = *table;
+        g_stream_selected_pending.miss_experts.swap(miss_experts);
+        g_stream_selected_pending.begin_t0 = pend_t0;
+    }
     return 1;
 }
 
@@ -27109,6 +27425,7 @@ static int cuda_glm_stream_selected_cache_matches(
         uint64_t down_expert_bytes,
         int logical_tier,
         int expert_id_bucketed) {
+    if (!cuda_stream_selected_finish_pending()) return 0;
     return g_stream_selected_cache.valid &&
            g_stream_selected_cache.logical_tier == logical_tier &&
            g_stream_selected_cache.model_map == model_map &&
@@ -28759,6 +29076,7 @@ static int cuda_stream_resident_seed(const ds4_gpu_stream_expert_table *table,
                                     table->down_expert_bytes, 0)) {
         return 1;
     }
+    cuda_stream_outstanding_wait_all();
 
     std::vector<cuda_stream_read_job> jobs;
     std::vector<int32_t> admitted;

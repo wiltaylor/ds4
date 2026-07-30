@@ -37589,13 +37589,14 @@ static double glm_graph_memory_guard_default_reserve_gib(
      * it should approximate what the OS and the untracked part of the graph
      * actually need rather than be a blanket margin.  Measured on a 121 GiB
      * DGX Spark with GLM 5.2: a run holding 7000 experts is stable with
-     * 12.3 GiB free at its low-water mark, while 32 GiB left 30.7 GiB unused
+     * 12.3 GiB free at its low-water mark, a 16 GiB reserve still left
+     * 21.8 GiB unused at the low-water mark, and 32 GiB left 30.7 GiB unused
      * and cost ~1500 experts of hit rate.  The backstop against over-committing
      * is not this number but the streaming cache's own free-memory trim
      * (DS4_CUDA_STREAM_FREE_RESERVE_GB), which sizes the slabs against actual
      * free memory when they are reserved.
      */
-    if (base_gib >= 96.0 && base_gib <= 200.0) return 16.0;
+    if (base_gib >= 96.0 && base_gib <= 200.0) return 10.0;
 #endif
     return 32.0;
 }
@@ -53643,6 +53644,32 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             effective_cache_bytes =
                 (uint64_t)cache_experts * per_expert_bytes;
         }
+#ifndef DS4_ROCM_BUILD
+        else {
+            /* On unified-memory CUDA the guard's own accounting (working set
+             * minus model, graph and reserve) is the truthful budget; the
+             * generic plan's 80% model target is a Metal-era heuristic that
+             * leaves double-digit GiB idle here.  Raise to the guard cap; the
+             * streaming cache's free-memory trim at slab reservation remains
+             * the hard backstop. */
+            uint64_t raised_experts =
+                glm_gpu_guard_cap_bytes / per_expert_bytes;
+            if (raised_experts > max_model_experts) {
+                raised_experts = max_model_experts;
+            }
+            if (raised_experts > cache_experts) {
+                cache_experts = raised_experts > UINT32_MAX ?
+                    UINT32_MAX : (uint32_t)raised_experts;
+                effective_cache_bytes =
+                    (uint64_t)cache_experts * per_expert_bytes;
+                fprintf(stderr,
+                        "ds4:   GLM %s cache raised to %.2f GiB by the "
+                        "memory-guard accounting\n",
+                        ds4_backend_name(e->backend),
+                        (double)effective_cache_bytes / 1073741824.0);
+            }
+        }
+#endif
     }
 #endif
 
