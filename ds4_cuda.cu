@@ -582,6 +582,7 @@ static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
+static int g_q8_f32_disabled_after_oom;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
@@ -1193,6 +1194,35 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     (void)cudaGetLastError();
 }
 
+/*
+ * Drop the f32 weight-expansion cache and stop using it.  Same rationale as
+ * the f16 helper above: the expansion is only an optimization, so when cuBLAS
+ * rejects it under memory pressure the caller must be able to fall back to the
+ * native Q8 kernels rather than fail the whole forward pass.
+ */
+static void cuda_q8_f32_cache_disable_after_failure(const char *what,
+                                                   uint64_t request_bytes) {
+    if (!g_q8_f32_disabled_after_oom) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp32 cache disabled after %s "
+                "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
+                what ? what : "allocation failure",
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f32_bytes / 1073741824.0);
+    }
+    g_q8_f32_disabled_after_oom = 1;
+    if (!g_q8_f32_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+            if (r.device_ptr) (void)cudaFree(r.device_ptr);
+        }
+        g_q8_f32_ranges.clear();
+        g_q8_f32_by_offset.clear();
+        g_q8_f32_bytes = 0;
+    }
+    (void)cudaGetLastError();
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_cache_suppressed) return 0;
@@ -1252,6 +1282,7 @@ static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint6
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_q8_cache_suppressed) return 0;
+    if (g_q8_f32_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
     if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
     if (label && strstr(label, "attn_q_b") != NULL) {
@@ -12755,7 +12786,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                             &beta,
                                             (float *)out->ptr,
                                             (int)out_dim);
-            return cublas_ok(st, "q8 fp32 matmul");
+            if (st == CUBLAS_STATUS_SUCCESS) return 1;
+            fprintf(stderr, "ds4: cuBLAS q8 fp32 matmul failed: status %d\n",
+                    (int)st);
+            /* The F32 expansion cache is only an optimization.  Under memory
+             * pressure cuBLAS returns INTERNAL_ERROR here (seen on GB10 during
+             * a 7k-token prefill with the expert cache resident), so release it
+             * and retry through the native Q8 kernels below instead of failing
+             * the whole prefill.  Mirrors the F16 path underneath. */
+            cuda_q8_f32_cache_disable_after_failure(
+                    "cuBLAS f32 matmul failure",
+                    in_dim * out_dim * sizeof(float));
         }
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f16) {
