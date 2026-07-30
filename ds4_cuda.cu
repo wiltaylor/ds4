@@ -5989,6 +5989,36 @@ static int cuda_q8_mma_try_launch(
  * once per process catches any arch where the tensor-core path is wrong and
  * simply falls back to the exact kernels.
  */
+/* Reports the arch the device code was actually compiled for, so a failing
+ * self-check can name the real cause (an -arch below sm_80 compiles the
+ * mma.sync helper out to a no-op) instead of looking like a hardware fault. */
+__global__ static void cuda_report_device_arch_kernel(int *out) {
+#ifdef __CUDA_ARCH__
+    out[0] = __CUDA_ARCH__;
+#else
+    out[0] = -1;
+#endif
+}
+
+static int cuda_compiled_device_arch(void) {
+    static int cached;
+    if (cached == 0) {
+        cached = -1;
+        int *d = NULL;
+        if (cudaMalloc((void **)&d, sizeof(int)) == cudaSuccess) {
+            int h = -1;
+            cuda_report_device_arch_kernel<<<1, 1>>>(d);
+            if (cudaDeviceSynchronize() == cudaSuccess &&
+                cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                cached = h;
+            }
+            (void)cudaFree(d);
+        }
+        (void)cudaGetLastError();
+    }
+    return cached;
+}
+
 static int cuda_q8_mma_self_check_run(void) {
     enum { SC_IN = 64u, SC_OUT = 64u, SC_TOK = 16u };
     const uint64_t sc_blocks = SC_IN / 32u;      /* 2 */
@@ -6075,10 +6105,25 @@ static int cuda_q8_mma_verified(void) {
         const int rc = cuda_q8_mma_self_check_run();
         if (rc != 1) {
             state = -1;
+            const int arch = cuda_compiled_device_arch();
             fprintf(stderr,
                     "ds4: CUDA Q8 tensor-core matmul %s the self-check; "
                     "using exact kernels instead\n",
                     rc == 0 ? "failed" : "could not run");
+            if (arch >= 0 && arch < 800) {
+                fprintf(stderr,
+                        "ds4:   device code was compiled for __CUDA_ARCH__=%d; "
+                        "mma.sync needs >= 800, so it was compiled out to a "
+                        "no-op. Rebuild with an explicit arch, e.g. "
+                        "make cuda CUDA_ARCH=sm_121\n",
+                        arch);
+            } else if (arch >= 0) {
+                fprintf(stderr,
+                        "ds4:   device code arch is __CUDA_ARCH__=%d, so this "
+                        "looks like a genuine tensor-core issue on this "
+                        "device\n",
+                        arch);
+            }
         }
     }
     return state > 0;

@@ -113,8 +113,14 @@ help:
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
 
+# GB10 reports compute capability 12.1.  The arch MUST be explicit: nvcc 13.3
+# defaults to sm_75, which silently compiles out every __CUDA_ARCH__ >= 800
+# device path (notably the mma.sync int8 tensor-core matmul, which then becomes
+# a no-op that writes zeros) and leaves the whole binary to JIT from Turing-level
+# PTX.  -arch=sm_121 emits both the sm_121 cubin and compute_121 PTX, so no GPU
+# is needed at build time and other Blackwell parts can still JIT.
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
