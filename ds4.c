@@ -404,7 +404,9 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
+    /* Both GPU backends built from the CUDA sources size the streaming expert
+     * cache from their own working-set recommendation. */
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
     if (backend == DS4_BACKEND_CUDA) return true;
 #else
     (void)backend;
@@ -37581,6 +37583,20 @@ static double glm_graph_memory_guard_default_reserve_gib(
         model_gib >= base_gib * 0.80) {
         return 24.0;
     }
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    /*
+     * Unified-memory CUDA (GB10 class).  This reserve is held back in full, so
+     * it should approximate what the OS and the untracked part of the graph
+     * actually need rather than be a blanket margin.  Measured on a 121 GiB
+     * DGX Spark with GLM 5.2: a run holding 7000 experts is stable with
+     * 12.3 GiB free at its low-water mark, while 32 GiB left 30.7 GiB unused
+     * and cost ~1500 experts of hit rate.  The backstop against over-committing
+     * is not this number but the streaming cache's own free-memory trim
+     * (DS4_CUDA_STREAM_FREE_RESERVE_GB), which sizes the slabs against actual
+     * free memory when they are reserved.
+     */
+    if (base_gib >= 96.0 && base_gib <= 200.0) return 16.0;
+#endif
     return 32.0;
 }
 
@@ -46731,6 +46747,14 @@ static int generate_glm_metal_argmax(
         }
     }
 #else
+    /*
+     * Not done on CUDA: prefill there is served by the transient per-layer
+     * selected slab, which is allocated on top of the resident expert cache
+     * and can be needed again at any time by a new request, so the prefill
+     * headroom stays reserved for the whole run.  Handing it to the resident
+     * cache would also mean re-reserving the slabs and discarding everything
+     * prefill just warmed (see ds4_gpu_set_streaming_expert_cache_budget).
+     */
     (void)ssd_streaming_cache_bytes;
     (void)ssd_streaming_prefill_headroom_bytes;
 #endif
@@ -53540,8 +53564,11 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         effective_cache_bytes = (uint64_t)cache_experts * per_expert_bytes;
     }
 
-#ifdef DS4_ROCM_BUILD
-    uint64_t glm_rocm_guard_cap_bytes = 0;
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+    /* Both GPU backends built from the CUDA sources hold the graph, the KV
+     * cache and the expert cache in the same pool, so the expert budget has
+     * to be what is left after the model and the graph reservation. */
+    uint64_t glm_gpu_guard_cap_bytes = 0;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         e->backend == DS4_BACKEND_CUDA) {
         const int requested_ctx = e->placement_ctx_hint > 0 ?
@@ -53596,17 +53623,18 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         const uint64_t fixed_bytes = glm_graph_saturating_add_u64(
                 active_model_bytes, graph_mem.total_bytes);
         if (guard_budget > fixed_bytes) {
-            glm_rocm_guard_cap_bytes = guard_budget - fixed_bytes;
+            glm_gpu_guard_cap_bytes = guard_budget - fixed_bytes;
         }
-        if (glm_rocm_guard_cap_bytes < per_expert_bytes) {
+        if (glm_gpu_guard_cap_bytes < per_expert_bytes) {
             fprintf(stderr,
-                    "ds4: GLM ROCm auto cache has no room after model, graph, "
-                    "and memory-guard reserves\n");
+                    "ds4: GLM %s auto cache has no room after model, graph, "
+                    "and memory-guard reserves\n",
+                    ds4_backend_name(e->backend));
             return false;
         }
-        if (effective_cache_bytes > glm_rocm_guard_cap_bytes) {
+        if (effective_cache_bytes > glm_gpu_guard_cap_bytes) {
             uint64_t capped_experts =
-                glm_rocm_guard_cap_bytes / per_expert_bytes;
+                glm_gpu_guard_cap_bytes / per_expert_bytes;
             if (capped_experts > max_model_experts) {
                 capped_experts = max_model_experts;
             }
@@ -53656,12 +53684,13 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 "--ssd-streaming-cache-experts NGB to override\n",
                 (double)glm_auto_cap_bytes / 1073741824.0);
     }
-#ifdef DS4_ROCM_BUILD
-    if (glm_rocm_guard_cap_bytes != 0 &&
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+    if (glm_gpu_guard_cap_bytes != 0 &&
         plan.effective_cache_bytes != effective_cache_bytes) {
         fprintf(stderr,
-                "ds4:   GLM ROCm cache capped to %.2f GiB by the memory "
+                "ds4:   GLM %s cache capped to %.2f GiB by the memory "
                 "guard for ctx=%d\n",
+                ds4_backend_name(e->backend),
                 (double)effective_cache_bytes / 1073741824.0,
                 e->placement_ctx_hint > 0 ? e->placement_ctx_hint : 4096);
     }
